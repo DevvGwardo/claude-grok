@@ -8,9 +8,12 @@ DEST="$DEST_DIR/claude-grok"
 
 mkdir -p "$DEST_DIR"
 install -m 755 "$ROOT/bin/claude-grok" "$DEST"
+install -m 755 "$ROOT/bin/claude-grok-bridge" "$DEST_DIR/claude-grok-bridge"
 
 cat <<EOF
-Installed: $DEST
+Installed:
+  $DEST
+  $DEST_DIR/claude-grok-bridge
 
 Prereqs (once):
   1. Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code
@@ -20,4 +23,7 @@ Prereqs (once):
 
 Then run:
   claude-grok
+
+Note: claude-grok starts a local sanitize bridge (:18766) in front of
+claude-code-proxy so Read(png)/image tool results don't 400 on Grok.
 EOF

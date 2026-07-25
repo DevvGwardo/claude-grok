@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Anthropic-compatible request sanitizer in front of claude-code-proxy.
+
+Grok translation in claude-code-proxy <=0.1.25 hard-fails with:
+  400 tool result supports text children only
+whenever Claude Code returns an image child inside tool_result (e.g. Read(png)).
+
+Upstream fix: https://github.com/raine/claude-code-proxy/pull/69
+Until that ships, this bridge rewrites non-text tool_result children (and
+top-level image blocks) into text placeholders, then forwards to the real proxy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import threading
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+
+DEFAULT_LISTEN = "127.0.0.1:18766"
+DEFAULT_UPSTREAM = "http://127.0.0.1:18765"
+
+
+def _image_omit_marker(block: dict[str, Any]) -> str:
+    source = block.get("source")
+    if isinstance(source, dict):
+        media = source.get("media_type") or source.get("mediaType")
+        if isinstance(media, str) and media:
+            return f"[image omitted: {media}]"
+        if source.get("type") == "url" and isinstance(source.get("url"), str):
+            return "[image omitted: url]"
+        if source.get("type") == "base64":
+            return "[image omitted: base64]"
+    return "[image omitted]"
+
+
+def _sanitize_tool_result_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+
+    texts: list[str] = []
+    changed = False
+    for part in content:
+        if not isinstance(part, dict):
+            texts.append(str(part))
+            changed = True
+            continue
+        typ = part.get("type")
+        if typ == "text":
+            text = part.get("text")
+            texts.append(text if isinstance(text, str) else "")
+            continue
+        if typ == "tool_reference":
+            # Upstream Grok translator skips these; drop quietly.
+            changed = True
+            continue
+        if typ == "image":
+            texts.append(_image_omit_marker(part))
+            changed = True
+            continue
+        # Unknown structured child → stringified placeholder (never forward raw).
+        texts.append(f"[omitted non-text tool_result child: {typ or 'unknown'}]")
+        changed = True
+
+    if not changed:
+        return content
+    return [{"type": "text", "text": "".join(texts)}]
+
+
+def _sanitize_message_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+
+    out: list[Any] = []
+    changed = False
+    for block in content:
+        if not isinstance(block, dict):
+            out.append(block)
+            continue
+        typ = block.get("type")
+        if typ == "tool_result":
+            new_block = dict(block)
+            sanitized = _sanitize_tool_result_content(block.get("content"))
+            if sanitized is not block.get("content"):
+                new_block["content"] = sanitized
+                changed = True
+            out.append(new_block)
+            continue
+        if typ == "image":
+            # Top-level images also 400 on Grok today; degrade to text.
+            out.append({"type": "text", "text": _image_omit_marker(block)})
+            changed = True
+            continue
+        out.append(block)
+
+    return out if changed else content
+
+
+def sanitize_anthropic_body(body: dict[str, Any]) -> dict[str, Any]:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    new_messages: list[Any] = []
+    changed = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            new_messages.append(msg)
+            continue
+        new_msg = dict(msg)
+        sanitized = _sanitize_message_content(msg.get("content"))
+        if sanitized is not msg.get("content"):
+            new_msg["content"] = sanitized
+            changed = True
+        new_messages.append(new_msg)
+
+    if not changed:
+        return body
+    out = dict(body)
+    out["messages"] = new_messages
+    return out
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    upstream_base: str = DEFAULT_UPSTREAM
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("[claude-grok-bridge] " + (fmt % args) + "\n")
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _forward(self, method: str) -> None:
+        raw = self._read_body()
+        path = self.path
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower()
+            not in {
+                "host",
+                "content-length",
+                "connection",
+                "transfer-encoding",
+                "accept-encoding",
+            }
+        }
+
+        # Rewrite Anthropic message payloads that Grok rejects.
+        if method == "POST" and raw and (
+            path.startswith("/v1/messages") or path.rstrip("/").endswith("/messages")
+        ):
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                sanitized = sanitize_anthropic_body(parsed)
+                if sanitized is not parsed:
+                    raw = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                    headers["Content-Type"] = "application/json"
+                    self.log_message("sanitized non-text tool/image blocks on %s", path)
+
+        url = self.upstream_base.rstrip("/") + path
+        req = urllib.request.Request(url, data=raw if method != "GET" else None, method=method)
+        for k, v in headers.items():
+            req.add_header(k, v)
+
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                payload = resp.read()
+                self.send_response(resp.status)
+                for k, v in resp.headers.items():
+                    if k.lower() in {"transfer-encoding", "connection", "content-encoding"}:
+                        continue
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            self.send_response(exc.code)
+            for k, v in exc.headers.items():
+                if k.lower() in {"transfer-encoding", "connection", "content-encoding"}:
+                    continue
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as exc:  # noqa: BLE001 - surface upstream connect failures
+            msg = json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"claude-grok-bridge upstream error: {exc}",
+                    },
+                }
+            ).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._forward("GET")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._forward("POST")
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self._forward("OPTIONS")
+
+
+def port_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex((host, port)) == 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--listen", default=os.environ.get("CLAUDE_GROK_BRIDGE_LISTEN", DEFAULT_LISTEN))
+    parser.add_argument(
+        "--upstream",
+        default=os.environ.get("CLAUDE_GROK_UPSTREAM", DEFAULT_UPSTREAM),
+    )
+    parser.add_argument("--check", action="store_true", help="exit 0 if listen port is already up")
+    args = parser.parse_args()
+
+    host, port_s = args.listen.rsplit(":", 1)
+    port = int(port_s)
+
+    if args.check:
+        return 0 if port_open(host, port) else 1
+
+    BridgeHandler.upstream_base = args.upstream.rstrip("/")
+    server = ThreadingHTTPServer((host, port), BridgeHandler)
+    print(f"claude-grok-bridge listening on http://{host}:{port} -> {BridgeHandler.upstream_base}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    # Allow importing sanitize helpers from tests without serving.
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        sample = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "aaa",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        out = sanitize_anthropic_body(sample)
+        content = out["messages"][0]["content"][0]["content"]
+        assert content == [{"type": "text", "text": "[image omitted: image/png]"}], content
+        print("self-test ok")
+        raise SystemExit(0)
+    raise SystemExit(main())

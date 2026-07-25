@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # Claude Code on Grok via local claude-code-proxy (subscription OAuth).
+#
+# Default path:
+#   Claude Code → claude-grok-bridge (:18766) → claude-code-proxy (:18765) → Grok
+#
+# The bridge sanitizes image tool_result children (Read(png/jpg/...)) so Grok
+# does not 400 with: "tool result supports text children only"
+# Upstream permanent fix: https://github.com/raine/claude-code-proxy/pull/69
+#
 # Usage:
 #   claude-grok                 # grok-4.5
 #   claude-grok grok-4.5
@@ -7,9 +15,23 @@
 #   claude-grok models
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROXY_BIN="${CLAUDE_GROK_PROXY_BIN:-$(command -v claude-code-proxy || true)}"
-PROXY_URL="${CLAUDE_GROK_BASE_URL:-http://127.0.0.1:18765}"
+PROXY_URL="${CLAUDE_GROK_UPSTREAM:-http://127.0.0.1:18765}"
+if [[ -n "${CLAUDE_GROK_BRIDGE_BIN:-}" ]]; then
+  BRIDGE_BIN="$CLAUDE_GROK_BRIDGE_BIN"
+elif [[ -x "$SCRIPT_DIR/claude-grok-bridge" ]]; then
+  BRIDGE_BIN="$SCRIPT_DIR/claude-grok-bridge"
+elif [[ -x "$SCRIPT_DIR/../bin/claude-grok-bridge" ]]; then
+  BRIDGE_BIN="$SCRIPT_DIR/../bin/claude-grok-bridge"
+else
+  BRIDGE_BIN="$(command -v claude-grok-bridge || true)"
+fi
+BRIDGE_LISTEN="${CLAUDE_GROK_BRIDGE_LISTEN:-127.0.0.1:18766}"
+BRIDGE_URL="${CLAUDE_GROK_BASE_URL:-http://${BRIDGE_LISTEN}}"
 DEFAULT_MODEL="${CLAUDE_GROK_MODEL:-grok-4.5}"
+# Set CLAUDE_GROK_DISABLE_BRIDGE=1 to talk to claude-code-proxy directly.
+DISABLE_BRIDGE="${CLAUDE_GROK_DISABLE_BRIDGE:-0}"
 
 die() {
   printf 'claude-grok: %s\n' "$*" >&2
@@ -27,13 +49,17 @@ ensure_auth() {
 }
 
 proxy_up() {
-  curl -fsS --max-time 1 "$PROXY_URL/v1/models" >/dev/null 2>&1
+  curl -fsS --max-time 1 "${PROXY_URL%/}/v1/models" >/dev/null 2>&1
+}
+
+bridge_up() {
+  [[ -x "$BRIDGE_BIN" ]] || return 1
+  python3 "$BRIDGE_BIN" --check --listen "$BRIDGE_LISTEN" >/dev/null 2>&1
 }
 
 start_proxy_if_needed() {
   proxy_up && return 0
 
-  # Prefer brew service when available (survives shells).
   if command -v brew >/dev/null 2>&1; then
     brew services start raine/claude-code-proxy/claude-code-proxy >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -42,7 +68,6 @@ start_proxy_if_needed() {
     done
   fi
 
-  # Fallback: background serve without monitor TUI.
   mkdir -p "$HOME/.local/state/claude-code-proxy"
   nohup env XDG_STATE_HOME="$HOME/.local/state" "$PROXY_BIN" serve --no-monitor \
     >>"$HOME/.local/state/claude-code-proxy/serve.log" 2>&1 &
@@ -51,6 +76,21 @@ start_proxy_if_needed() {
     sleep 0.2
   done
   die "proxy did not come up at $PROXY_URL (check ~/.local/state/claude-code-proxy/serve.log)"
+}
+
+start_bridge_if_needed() {
+  [[ "$DISABLE_BRIDGE" == "1" ]] && return 0
+  [[ -x "$BRIDGE_BIN" ]] || die "bridge missing: $BRIDGE_BIN"
+  bridge_up && return 0
+
+  mkdir -p "$HOME/.local/state/claude-grok"
+  nohup python3 "$BRIDGE_BIN" --listen "$BRIDGE_LISTEN" --upstream "$PROXY_URL" \
+    >>"$HOME/.local/state/claude-grok/bridge.log" 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    bridge_up && return 0
+    sleep 0.1
+  done
+  die "bridge did not come up at $BRIDGE_URL (check ~/.local/state/claude-grok/bridge.log)"
 }
 
 model="$DEFAULT_MODEL"
@@ -67,10 +107,17 @@ fi
 ensure_proxy_bin
 ensure_auth
 start_proxy_if_needed
+start_bridge_if_needed
 
-# Clear Anthropic/subscription env so Claude Code talks only to the proxy.
+if [[ "$DISABLE_BRIDGE" == "1" ]]; then
+  BASE_URL="$PROXY_URL"
+else
+  BASE_URL="$BRIDGE_URL"
+fi
+
+# Clear Anthropic/subscription env so Claude Code talks only to the proxy/bridge.
 exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_LOG -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS \
-  ANTHROPIC_BASE_URL="$PROXY_URL" \
+  ANTHROPIC_BASE_URL="$BASE_URL" \
   ANTHROPIC_AUTH_TOKEN="${CLAUDE_GROK_AUTH_TOKEN:-unused}" \
   ANTHROPIC_API_KEY="" \
   ANTHROPIC_MODEL="$model" \
