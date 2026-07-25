@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Claude Code on Grok via local claude-code-proxy (subscription OAuth).
 #
-# Default path:
-#   Claude Code → claude-grok-bridge (:18766) → claude-code-proxy (:18765) → Grok
+# Default path (patched proxy):
+#   Claude Code → claude-code-proxy (:18765, CCP_GROK_TOOL_IMAGE=reattach) → Grok
 #
-# The bridge sanitizes image tool_result children (Read(png/jpg/...)) so Grok
-# does not 400 with: "tool result supports text children only"
-# Upstream permanent fix: https://github.com/raine/claude-code-proxy/pull/69
+# Optional fallback sanitize bridge:
+#   Claude Code → claude-grok-bridge (:18766) → proxy → Grok
+#
+# Stock Homebrew proxy ≤0.1.25 400s on Read(png) image tool_results.
+# Prefer ~/.local/bin/claude-code-proxy (v0.1.25 + PR #69). See docs/PATCHED-PROXY.md.
 #
 # Usage:
 #   claude-grok                 # grok-4.5
@@ -16,7 +18,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROXY_BIN="${CLAUDE_GROK_PROXY_BIN:-$(command -v claude-code-proxy || true)}"
+if [[ -n "${CLAUDE_GROK_PROXY_BIN:-}" ]]; then
+  PROXY_BIN="$CLAUDE_GROK_PROXY_BIN"
+elif [[ -x "$HOME/.local/bin/claude-code-proxy" ]]; then
+  PROXY_BIN="$HOME/.local/bin/claude-code-proxy"
+else
+  PROXY_BIN="$(command -v claude-code-proxy || true)"
+fi
 PROXY_URL="${CLAUDE_GROK_UPSTREAM:-http://127.0.0.1:18765}"
 if [[ -n "${CLAUDE_GROK_BRIDGE_BIN:-}" ]]; then
   BRIDGE_BIN="$CLAUDE_GROK_BRIDGE_BIN"
@@ -28,10 +36,13 @@ else
   BRIDGE_BIN="$(command -v claude-grok-bridge || true)"
 fi
 BRIDGE_LISTEN="${CLAUDE_GROK_BRIDGE_LISTEN:-127.0.0.1:18766}"
-BRIDGE_URL="${CLAUDE_GROK_BASE_URL:-http://${BRIDGE_LISTEN}}"
+BRIDGE_URL="http://${BRIDGE_LISTEN}"
 DEFAULT_MODEL="${CLAUDE_GROK_MODEL:-grok-4.5}"
-# Set CLAUDE_GROK_DISABLE_BRIDGE=1 to talk to claude-code-proxy directly.
-DISABLE_BRIDGE="${CLAUDE_GROK_DISABLE_BRIDGE:-0}"
+# Set CLAUDE_GROK_DISABLE_BRIDGE=0 to force the sanitize bridge.
+# Default is off now that the patched proxy handles image tool_results
+# (CCP_GROK_TOOL_IMAGE=reattach). Bridge remains available as fallback.
+DISABLE_BRIDGE="${CLAUDE_GROK_DISABLE_BRIDGE:-1}"
+
 
 die() {
   printf 'claude-grok: %s\n' "$*" >&2
@@ -60,6 +71,15 @@ bridge_up() {
 start_proxy_if_needed() {
   proxy_up && return 0
 
+  # Prefer the patched LaunchAgent when present.
+  if launchctl print "gui/$(id -u)/com.devgwardo.claude-code-proxy" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$(id -u)/com.devgwardo.claude-code-proxy" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      proxy_up && return 0
+      sleep 0.2
+    done
+  fi
+
   if command -v brew >/dev/null 2>&1; then
     brew services start raine/claude-code-proxy/claude-code-proxy >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -69,13 +89,14 @@ start_proxy_if_needed() {
   fi
 
   mkdir -p "$HOME/.local/state/claude-code-proxy"
-  nohup env XDG_STATE_HOME="$HOME/.local/state" "$PROXY_BIN" serve --no-monitor \
+  nohup env XDG_STATE_HOME="$HOME/.local/state" CCP_GROK_TOOL_IMAGE="${CCP_GROK_TOOL_IMAGE:-reattach}" \
+    "$PROXY_BIN" serve --no-monitor \
     >>"$HOME/.local/state/claude-code-proxy/serve.log" 2>&1 &
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     proxy_up && return 0
     sleep 0.2
   done
-  die "proxy did not come up at $PROXY_URL (check ~/.local/state/claude-code-proxy/serve.log)"
+  die "proxy did not come up at $PROXY_URL (check ~/.local/state/claude-code-proxy/)"
 }
 
 start_bridge_if_needed() {
@@ -110,9 +131,9 @@ start_proxy_if_needed
 start_bridge_if_needed
 
 if [[ "$DISABLE_BRIDGE" == "1" ]]; then
-  BASE_URL="$PROXY_URL"
+  BASE_URL="${CLAUDE_GROK_BASE_URL:-$PROXY_URL}"
 else
-  BASE_URL="$BRIDGE_URL"
+  BASE_URL="${CLAUDE_GROK_BASE_URL:-$BRIDGE_URL}"
 fi
 
 # Clear Anthropic/subscription env so Claude Code talks only to the proxy/bridge.
