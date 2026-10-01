@@ -19,11 +19,17 @@ Prereqs (once):
   1. Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code
   2. brew install raine/claude-code-proxy/claude-code-proxy
   3. claude-code-proxy grok auth login
-  4. brew services start raine/claude-code-proxy/claude-code-proxy
+  4. Optional Codex for /model switching:
+       claude-code-proxy codex auth login
+       # or keep Codex CLI logged in (~/.codex/auth.json is imported on launch)
+  5. Prefer patched proxy + LaunchAgent — see docs/PATCHED-PROXY.md
 
 Then run:
   claude-grok
+  claude-grok models
+  claude-grok auth
 
-Note: claude-grok starts a local sanitize bridge (:18766) in front of
-claude-code-proxy so Read(png)/image tool results don't 400 on Grok.
+Inside Claude Code:
+  /model                  # Grok custom row + Codex claude-* aliases
+  /model gpt-5.6-sol      # Codex by typed id
 EOF

@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Claude Code on Grok via local claude-code-proxy (subscription OAuth).
+# Claude Code on Grok / Codex (and friends) via local claude-code-proxy.
 #
 # Default path (patched proxy):
-#   Claude Code → claude-code-proxy (:18765, CCP_GROK_TOOL_IMAGE=reattach) → Grok
+#   Claude Code → claude-code-proxy (:18765) → provider selected by model id
 #
-# Optional fallback sanitize bridge:
-#   Claude Code → claude-grok-bridge (:18766) → proxy → Grok
-#
-# Stock Homebrew proxy ≤0.1.25 400s on Read(png) image tool_results.
-# Prefer ~/.local/bin/claude-code-proxy (v0.1.25 + PR #69). See docs/PATCHED-PROXY.md.
+# /model switching:
+#   - CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 loads proxy /v1/models
+#   - Claude only auto-lists ids starting with claude/anthropic → Codex aliases
+#   - Cursor Grok is pinned into the picker via ANTHROPIC_CUSTOM_MODEL_OPTION
+#     (cursor:grok-4.5 — same id as Cursor IDE "Cursor Grok 4.5 High")
+#   - Other ids still work: /model cursor:grok-4.5 | cursor-plan:grok-4.5 | gpt-5.6-sol | …
 #
 # Usage:
-#   claude-grok                 # grok-4.5
-#   claude-grok grok-4.5
-#   claude-grok grok-composer-2.5-fast
+#   claude-grok                      # default grok-4.5 (grok.com Build)
+#   claude-grok cursor:grok-4.5      # Cursor plan Grok via ACP (T3 path)
+#   claude-grok grok-4.5             # grok.com Build (quota-limited)
+#   claude-grok cursor-plan:grok-4.5 # Cursor plan mode + Grok
+#   claude-grok gpt-5.6-sol          # Codex
 #   claude-grok models
+#   claude-grok auth
+#   claude-grok -p "say hi"
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -38,25 +43,168 @@ fi
 BRIDGE_LISTEN="${CLAUDE_GROK_BRIDGE_LISTEN:-127.0.0.1:18766}"
 BRIDGE_URL="http://${BRIDGE_LISTEN}"
 DEFAULT_MODEL="${CLAUDE_GROK_MODEL:-grok-4.5}"
+# Background / alias defaults prefer Codex so Grok Build quota isn't burned on
+# titles, compaction helpers, or /model sonnet|opus|haiku.
+SMALL_MODEL="${CLAUDE_GROK_SMALL_MODEL:-claude-haiku-4-5}"
+OPUS_MODEL="${CLAUDE_GROK_OPUS_MODEL:-claude-opus-4-7}"
+SONNET_MODEL="${CLAUDE_GROK_SONNET_MODEL:-claude-sonnet-4-6}"
+HAIKU_MODEL="${CLAUDE_GROK_HAIKU_MODEL:-claude-haiku-4-5}"
+SUBAGENT_MODEL="${CLAUDE_GROK_SUBAGENT_MODEL:-$SONNET_MODEL}"
 # Set CLAUDE_GROK_DISABLE_BRIDGE=0 to force the sanitize bridge.
-# Default is off now that the patched proxy handles image tool_results
-# (CCP_GROK_TOOL_IMAGE=reattach). Bridge remains available as fallback.
 DISABLE_BRIDGE="${CLAUDE_GROK_DISABLE_BRIDGE:-1}"
-
+# Import ~/.codex/auth.json into the proxy on launch (default on).
+SYNC_CODEX="${CLAUDE_GROK_SYNC_CODEX:-1}"
+# Import Cursor IDE keychain tokens into the proxy (default on).
+SYNC_CURSOR="${CLAUDE_GROK_SYNC_CURSOR:-1}"
+# Picker custom row: Cursor-subscription Grok (experimental — ACP agent wrap;
+# slow/unreliable as a Claude Code tool backend). Prefer Codex claude-* ids.
+CUSTOM_MODEL="${CLAUDE_GROK_CUSTOM_MODEL:-cursor:grok-4.5}"
+CUSTOM_MODEL_NAME="${CLAUDE_GROK_CUSTOM_MODEL_NAME:-Cursor Grok 4.5 (experimental)}"
+CUSTOM_MODEL_DESC="${CLAUDE_GROK_CUSTOM_MODEL_DESC:-Experimental ACP wrap — prefer /model claude-sonnet-4-6}"
 
 die() {
   printf 'claude-grok: %s\n' "$*" >&2
   exit 1
 }
 
+warn() {
+  printf 'claude-grok: %s\n' "$*" >&2
+}
+
 ensure_proxy_bin() {
   [[ -n "$PROXY_BIN" && -x "$PROXY_BIN" ]] || die "claude-code-proxy not found (brew install raine/claude-code-proxy/claude-code-proxy)"
 }
 
+provider_auth_ok() {
+  local provider="$1"
+  "$PROXY_BIN" "$provider" auth status >/dev/null 2>&1
+}
+
+# Seed Codex auth for the proxy from the official Codex CLI store when present.
+# CCP docs: proxy does not auto-read ~/.codex; file auth is checked before Keychain.
+sync_codex_auth_from_cli() {
+  [[ "$SYNC_CODEX" == "1" ]] || return 0
+  local src="$HOME/.codex/auth.json"
+  local dest_dir="$HOME/.config/claude-code-proxy/codex"
+  local dest="$dest_dir/auth.json"
+  [[ -f "$src" ]] || return 0
+
+  python3 - "$src" "$dest" <<'PY'
+import json, sys, time
+from pathlib import Path
+
+src, dest = Path(sys.argv[1]), Path(sys.argv[2])
+raw = json.loads(src.read_text())
+tokens = raw.get("tokens") or {}
+access = tokens.get("access_token") or ""
+refresh = tokens.get("refresh_token") or ""
+account = tokens.get("account_id")
+if not access or not refresh:
+    raise SystemExit(0)
+
+# Prefer JWT exp (seconds) → ms; else ~1h from now.
+expires_ms = int(time.time() * 1000) + 3600_000
+try:
+    import base64
+    payload = access.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload))
+    if isinstance(claims.get("exp"), (int, float)):
+        expires_ms = int(claims["exp"] * 1000)
+except Exception:
+    pass
+
+out = {
+    "access": access,
+    "refresh": refresh,
+    "expires": expires_ms,
+}
+if account:
+    out["accountId"] = account
+
+dest.parent.mkdir(parents=True, exist_ok=True)
+tmp = dest.with_suffix(".tmp")
+tmp.write_text(json.dumps(out))
+tmp.chmod(0o600)
+tmp.replace(dest)
+print(f"synced Codex auth → {dest}")
+PY
+}
+
+# Seed Cursor auth from the IDE keychain entries Cursor already stores.
+# Proxy does not read these itself (docs). File auth is checked before Keychain.
+sync_cursor_auth_from_ide() {
+  [[ "$SYNC_CURSOR" == "1" ]] || return 0
+  local dest_dir="$HOME/.config/claude-code-proxy/cursor"
+  local dest="$dest_dir/auth.json"
+  local access refresh
+  access="$(security find-generic-password -s cursor-access-token -a cursor-user -w 2>/dev/null || true)"
+  refresh="$(security find-generic-password -s cursor-refresh-token -a cursor-user -w 2>/dev/null || true)"
+  [[ -n "$access" ]] || return 0
+
+  ACCESS_TOKEN="$access" REFRESH_TOKEN="$refresh" DEST="$dest" python3 <<'PY'
+import json, os
+from pathlib import Path
+dest = Path(os.environ["DEST"])
+out = {"accessToken": os.environ["ACCESS_TOKEN"]}
+refresh = os.environ.get("REFRESH_TOKEN") or ""
+if refresh:
+    out["refreshToken"] = refresh
+dest.parent.mkdir(parents=True, exist_ok=True)
+tmp = dest.with_suffix(".tmp")
+tmp.write_text(json.dumps(out))
+tmp.chmod(0o600)
+tmp.replace(dest)
+print(f"synced Cursor auth → {dest}")
+PY
+}
+
 ensure_auth() {
-  if ! "$PROXY_BIN" grok auth status >/dev/null 2>&1; then
+  if ! provider_auth_ok grok; then
     die "Grok not authenticated. Run: claude-code-proxy grok auth login"
   fi
+  sync_codex_auth_from_cli || true
+  sync_cursor_auth_from_ide || true
+  if ! provider_auth_ok codex; then
+    warn "Codex not authenticated — /model claude-* and gpt-* will 401 until you run:"
+    warn "  claude-code-proxy codex auth login"
+    warn "  (or keep ~/.codex/auth.json fresh and re-run claude-grok)"
+  fi
+  if ! provider_auth_ok cursor; then
+    warn "Cursor not authenticated — /model cursor:grok-4.5 will 401 until you run:"
+    warn "  claude-code-proxy cursor auth login"
+    warn "  (or unlock Keychain access for cursor-*-token and re-run claude-grok)"
+  fi
+}
+
+show_auth() {
+  ensure_proxy_bin
+  sync_codex_auth_from_cli || true
+  sync_cursor_auth_from_ide || true
+  echo "Provider auth:"
+  for p in grok codex kimi cursor; do
+    if out="$("$PROXY_BIN" "$p" auth status 2>&1)"; then
+      printf '  %s: ok\n' "$p"
+      printf '%s\n' "$out" | sed 's/^/    /'
+    else
+      printf '  %s: not authenticated\n' "$p"
+    fi
+  done
+}
+
+show_models() {
+  ensure_proxy_bin
+  start_proxy_if_needed
+  echo "Proxy catalog (id → provider). Use with: claude-grok <id>  or  /model <id>"
+  echo
+  "$PROXY_BIN" models
+  echo
+  echo "Picker notes:"
+  echo "  • Gateway discovery lists claude*/anthropic* ids (Codex aliases) in /model"
+  echo "  • Custom picker row: $CUSTOM_MODEL ($CUSTOM_MODEL_NAME)"
+  echo "  • grok.com Build: /model grok-4.5"
+  echo "  • Cursor Plan mode: /model cursor-plan:grok-4.5"
+  echo "  • Type any other id: /model gpt-5.6-sol | composer-2.5 | kimi-k2.6"
 }
 
 proxy_up() {
@@ -71,7 +219,6 @@ bridge_up() {
 start_proxy_if_needed() {
   proxy_up && return 0
 
-  # Prefer the patched LaunchAgent when present.
   if launchctl print "gui/$(id -u)/com.devgwardo.claude-code-proxy" >/dev/null 2>&1; then
     launchctl kickstart -k "gui/$(id -u)/com.devgwardo.claude-code-proxy" >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -90,6 +237,7 @@ start_proxy_if_needed() {
 
   mkdir -p "$HOME/.local/state/claude-code-proxy"
   nohup env XDG_STATE_HOME="$HOME/.local/state" CCP_GROK_TOOL_IMAGE="${CCP_GROK_TOOL_IMAGE:-reattach}" \
+    CCP_ALIAS_PROVIDER="${CCP_ALIAS_PROVIDER:-codex}" \
     "$PROXY_BIN" serve --no-monitor \
     >>"$HOME/.local/state/claude-code-proxy/serve.log" 2>&1 &
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -114,13 +262,33 @@ start_bridge_if_needed() {
   die "bridge did not come up at $BRIDGE_URL (check ~/.local/state/claude-grok/bridge.log)"
 }
 
+looks_like_model() {
+  case "$1" in
+    grok-*|gpt-*|claude-*|kimi-*|composer-*|cursor|cursor-*|cursor:*|cursor-plan:*|cursor-ask:*|cursor-agent:*|fable|opus|sonnet|haiku|k2.6|k3|*-fast)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 model="$DEFAULT_MODEL"
-if [[ "${1:-}" == "models" ]]; then
-  ensure_proxy_bin
-  "$PROXY_BIN" models | sed -n 's/^grok: //p'
-  exit 0
-fi
-if [[ "${1:-}" == "grok-4.5" || "${1:-}" == "grok-composer-2.5-fast" ]]; then
+case "${1:-}" in
+  models)
+    show_models
+    exit 0
+    ;;
+  auth)
+    show_auth
+    exit 0
+    ;;
+  help|-h|--help)
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+if [[ $# -gt 0 ]] && looks_like_model "$1"; then
   model="$1"
   shift
 fi
@@ -137,16 +305,22 @@ else
 fi
 
 # Clear Anthropic/subscription env so Claude Code talks only to the proxy/bridge.
+# Discovery + custom option populate /model; aliases route via CCP_ALIAS_PROVIDER=codex.
 exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_LOG -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS \
   ANTHROPIC_BASE_URL="$BASE_URL" \
   ANTHROPIC_AUTH_TOKEN="${CLAUDE_GROK_AUTH_TOKEN:-unused}" \
   ANTHROPIC_API_KEY="" \
   ANTHROPIC_MODEL="$model" \
-  ANTHROPIC_SMALL_FAST_MODEL="$model" \
-  ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
-  ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
-  CLAUDE_CODE_SUBAGENT_MODEL="$model" \
+  ANTHROPIC_SMALL_FAST_MODEL="$SMALL_MODEL" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$OPUS_MODEL" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="$SONNET_MODEL" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$HAIKU_MODEL" \
+  CLAUDE_CODE_SUBAGENT_MODEL="$SUBAGENT_MODEL" \
+  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+  ANTHROPIC_CUSTOM_MODEL_OPTION="$CUSTOM_MODEL" \
+  ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$CUSTOM_MODEL_NAME" \
+  ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="$CUSTOM_MODEL_DESC" \
+  CCP_ALIAS_PROVIDER="${CCP_ALIAS_PROVIDER:-codex}" \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=0 \
